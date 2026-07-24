@@ -17,6 +17,7 @@ pub const PORTS_LIST: [&str; 5] = ["32432", "24325", "24377", "25379", "36727"];
 pub enum Message {
     Move(u16),
     Chat(String),
+    DropConnection,
     KeepAlive,
 }
 
@@ -54,7 +55,8 @@ pub struct ConnectionStatus {
     pub ack_bitfield_them: u32,
 
     pub curr_id_us: u32,
-    pub last_contact: Instant,
+    pub last_contact_them: Instant,
+    pub last_contact_us: Instant,
 }
 
 pub async fn punch_hole(socket: &UdpSocket, peer_ip: IpAddr) -> Result<SocketAddr, &'static str> {
@@ -146,7 +148,8 @@ impl Default for ConnectionStatus {
             ack_bitfield_them: 0,
             curr_processed_id_them: 0,
             curr_id_us: 0,
-            last_contact: Instant::now(),
+            last_contact_them: Instant::now(),
+            last_contact_us: Instant::now(),
         }
     }
 }
@@ -193,7 +196,7 @@ impl Connection {
     pub async fn process_packet(&mut self, packet: Packet) {
         println!("Processing packet: {:?}", packet);
 
-        self.status.last_contact = Instant::now();
+        self.status.last_contact_them = Instant::now();
 
         self.process_ack(packet.ack_base_id, packet.ack_bitfield);
 
@@ -255,7 +258,9 @@ impl Connection {
     pub async fn send(&mut self, message: Message) {
         println!("Sending message:{:?}", message);
 
-        self.status.curr_id_us += 1;
+        if message != Message::KeepAlive && message != Message::DropConnection {
+            self.status.curr_id_us += 1;
+        }
 
         let packet = Packet {
             sequence_id: self.status.curr_id_us,
@@ -266,6 +271,7 @@ impl Connection {
 
         let bytes: Vec<u8> = bincode::serialize(&packet).unwrap();
         let _ = self.socket.send_to(&bytes, self.peer).await;
+        self.status.last_contact_us = Instant::now();
 
         let packet_pending = PacketPending {
             packet,
@@ -280,13 +286,28 @@ impl Connection {
 
     pub async fn main_loop(mut self) {
         let mut buf = [0; 1024];
+        let mut ticker = interval(Duration::from_millis(50));
 
         loop {
             tokio::select! {
+                _ = ticker.tick() => {
+                    if Instant::now() - self.status.last_contact_us >= Duration::from_secs(1) {
+                        self.send(Message::KeepAlive).await;
+                    }
+
+                    if Instant::now() - self.status.last_contact_them >= Duration::from_secs(5) {
+                        self.send(Message::DropConnection).await;
+                        return;
+                    }
+                }
+
                 incoming_message = self.socket.recv_from(&mut buf) => {
                     if let Ok((len, from)) = incoming_message && from == self.peer {
                         match bincode::deserialize::<Packet>(&buf[..len]) {
                             Ok(packet) => {
+                                if packet.payload == Message::DropConnection {
+                                    return;
+                                }
                                 self.process_packet(packet).await;
                         },
                             Err(e) => eprintln!("Failed to parse packet: {}", e),
@@ -353,9 +374,16 @@ async fn main() {
         }
     });
 
-    let message = Message::Chat("Hello world!".to_owned());
+    tokio::spawn(async move {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let mut stdin = BufReader::new(tokio::io::stdin());
+        let mut line = String::new();
 
-    let _ = from_app_tx.send(message).await;
+        while stdin.read_line(&mut line).await.unwrap_or(0) > 0 {
+            let _ = from_app_tx.send(Message::Chat(line.clone())).await;
+            line.clear();
+        }
+    });
 
     let _ = tokio::signal::ctrl_c().await;
 }
