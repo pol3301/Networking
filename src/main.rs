@@ -17,6 +17,7 @@ pub const PORTS_LIST: [&str; 5] = ["32432", "24325", "24377", "25379", "36727"];
 pub enum Message {
     Move(u16),
     Chat(String),
+    EstablishedConnection,
     DropConnection,
     KeepAlive,
 }
@@ -215,8 +216,6 @@ impl Connection {
     }
 
     pub async fn process_packet(&mut self, packet: Packet) {
-        // println!("Processing packet: {:?}", packet);
-
         self.status.last_contact_them = Instant::now();
 
         self.process_ack(packet.ack_base_id, packet.ack_bitfield);
@@ -277,9 +276,9 @@ impl Connection {
     }
 
     pub async fn send(&mut self, message: Message) {
-        println!("Sending: {:?}", message);
+        let should_be_acked = message == Message::KeepAlive || message == Message::DropConnection;
 
-        if message != Message::KeepAlive && message != Message::DropConnection {
+        if should_be_acked {
             self.status.curr_id_us += 1;
         }
 
@@ -294,20 +293,24 @@ impl Connection {
         let _ = self.socket.send_to(&bytes, self.peer).await;
         self.status.last_contact_us = Instant::now();
 
-        let packet_pending = PacketPending {
-            packet,
-            tries: 0,
-            last_tried: Instant::now(),
-        };
+        if should_be_acked {
+            let packet_pending = PacketPending {
+                packet,
+                tries: 0,
+                last_tried: Instant::now(),
+            };
 
-        self.status
-            .unacked_queue
-            .insert(self.status.curr_id_us, packet_pending);
+            self.status
+                .unacked_queue
+                .insert(self.status.curr_id_us, packet_pending);
+        }
     }
 
     pub async fn main_loop(mut self) {
         let mut buf = [0; 1024];
         let mut ticker = interval(Duration::from_millis(50));
+
+        let _ = self.to_app.send(Message::EstablishedConnection).await;
 
         loop {
             tokio::select! {
@@ -320,6 +323,28 @@ impl Connection {
                         self.send(Message::DropConnection).await;
                         return;
                     }
+
+                    let mut should_drop = false;
+
+                    for unacked_packet in self.status.unacked_queue.values_mut() {
+                        if Instant::now() - unacked_packet.last_tried >= Duration::from_millis(200) {
+                            unacked_packet.tries += 1;
+                            let bytes: Vec<u8> = bincode::serialize(&unacked_packet.packet).unwrap();
+                            let _ = self.socket.send_to(&bytes, self.peer).await;
+
+                            unacked_packet.last_tried = Instant::now();
+
+                            if unacked_packet.tries >= 5 {
+                                should_drop = true;
+                                break;
+                            }
+                        }
+                    };
+
+                    if should_drop {
+                        self.send(Message::DropConnection).await;
+                        return;
+                    }
                 }
 
                 incoming_message = self.socket.recv_from(&mut buf) => {
@@ -327,6 +352,7 @@ impl Connection {
                         match bincode::deserialize::<Packet>(&buf[..len]) {
                             Ok(packet) => {
                                 if packet.payload == Message::DropConnection {
+                                    let _ = self.to_app.send(packet.payload).await;
                                     return;
                                 }
                                 self.process_packet(packet).await;
