@@ -7,7 +7,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 use tokio::{
     net::UdpSocket,
-    sync::mpsc::{Receiver, Sender},
+    sync::mpsc::{Receiver, Sender, channel},
     time::{self, Instant, interval},
 };
 
@@ -178,6 +178,27 @@ impl Connection {
         }
     }
 
+    pub fn create_connection(
+        socket: UdpSocket,
+        peer: IpAddr,
+    ) -> (Sender<Message>, Receiver<Message>) {
+        let (tx_app, rx_us) = channel(32);
+        let (tx_us, rx_app) = channel(32);
+
+        let tx_us_for_exit = tx_app.clone();
+        tokio::spawn(async move {
+            if let Ok(peer_addr) = punch_hole(&socket, peer).await {
+                let connection = Self::new(socket, peer_addr, rx_us, tx_us);
+                connection.main_loop().await;
+                let _ = tx_us_for_exit.send(Message::DropConnection).await;
+            } else {
+                eprintln!("Couldn't establish connection to {}", peer);
+            }
+        });
+
+        (tx_app, rx_app)
+    }
+
     pub fn process_ack(&mut self, ack: u32, ack_bitfield: u32) {
         self.status.unacked_queue.remove(&ack);
 
@@ -194,7 +215,7 @@ impl Connection {
     }
 
     pub async fn process_packet(&mut self, packet: Packet) {
-        println!("Processing packet: {:?}", packet);
+        // println!("Processing packet: {:?}", packet);
 
         self.status.last_contact_them = Instant::now();
 
@@ -256,7 +277,7 @@ impl Connection {
     }
 
     pub async fn send(&mut self, message: Message) {
-        println!("Sending message:{:?}", message);
+        println!("Sending: {:?}", message);
 
         if message != Message::KeepAlive && message != Message::DropConnection {
             self.status.curr_id_us += 1;
@@ -291,11 +312,11 @@ impl Connection {
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
-                    if Instant::now() - self.status.last_contact_us >= Duration::from_secs(1) {
+                    if Instant::now() - self.status.last_contact_us >= Duration::from_secs(4) {
                         self.send(Message::KeepAlive).await;
                     }
 
-                    if Instant::now() - self.status.last_contact_them >= Duration::from_secs(5) {
+                    if Instant::now() - self.status.last_contact_them >= Duration::from_secs(20) {
                         self.send(Message::DropConnection).await;
                         return;
                     }
@@ -317,7 +338,15 @@ impl Connection {
 
                 outgoing_message = self.from_app.recv() => {
                     if let Some(message) = outgoing_message {
+                        let is_drop = message == Message::DropConnection;
                         self.send(message).await;
+
+                        if is_drop {
+                            return;
+                        }
+                    } else {
+                        self.send(Message::DropConnection).await;
+                        return;
                     }
                 }
             }
@@ -351,28 +380,17 @@ async fn main() {
         .parse::<std::net::IpAddr>()
         .unwrap_or_else(|_| panic!("Could not parse address {}", args[1]));
 
-    let (from_app_tx, from_app_rx) = tokio::sync::mpsc::channel(1);
-    let (to_app_tx, mut to_app_rx) = tokio::sync::mpsc::channel(1);
-
-    match punch_hole(&socket, peer_ip).await {
-        Ok(addr) => {
-            println!("Punched a hole! Peer's port is: {}", addr.port());
-            let connection = Connection::new(socket, addr, from_app_rx, to_app_tx);
-            tokio::spawn(connection.main_loop());
-        }
-        Err(e) => {
-            eprintln!("{}", e);
-            return;
-        }
-    }
+    let (from_app, mut to_app) = Connection::create_connection(socket, peer_ip);
 
     tokio::spawn(async move {
         loop {
-            if let Some(message) = to_app_rx.recv().await {
+            if let Some(message) = to_app.recv().await {
                 println!("Received message: {:?}", message);
             }
         }
     });
+
+    let from_app_stdin = from_app.clone();
 
     tokio::spawn(async move {
         use tokio::io::{AsyncBufReadExt, BufReader};
@@ -380,10 +398,14 @@ async fn main() {
         let mut line = String::new();
 
         while stdin.read_line(&mut line).await.unwrap_or(0) > 0 {
-            let _ = from_app_tx.send(Message::Chat(line.clone())).await;
+            let _ = from_app_stdin.send(Message::Chat(line.clone())).await;
             line.clear();
         }
     });
 
     let _ = tokio::signal::ctrl_c().await;
+
+    let _ = from_app.send(Message::DropConnection).await;
+
+    time::sleep(Duration::from_millis(100)).await;
 }
