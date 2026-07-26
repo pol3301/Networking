@@ -11,6 +11,14 @@ use tokio::{
     time::{self, Instant, interval},
 };
 
+macro_rules! debug_print {
+    ($($arg:tt)*) => {
+        if cfg!(debug_assertions) {
+            println!($($arg)*);
+        }
+    };
+}
+
 pub const PORTS_LIST: [&str; 5] = ["32432", "24325", "24377", "25379", "36727"];
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
@@ -279,7 +287,7 @@ impl Connection {
     }
 
     pub async fn send(&mut self, message: Message) {
-        let should_be_acked = message == Message::KeepAlive || message == Message::DropConnection;
+        let should_be_acked = message != Message::KeepAlive && message != Message::DropConnection;
 
         if should_be_acked {
             self.status.curr_id_us += 1;
@@ -323,6 +331,7 @@ impl Connection {
                     }
 
                     if Instant::now() - self.status.last_contact_them >= Duration::from_secs(20) {
+                        debug_print!("Dropping connection because of 20 second timeout");
                         self.drop_connection().await;
                         return;
                     }
@@ -346,6 +355,7 @@ impl Connection {
 
                     if should_drop {
                         self.drop_connection().await;
+                        debug_print!("Dropping connection because of unacked message");
                         return;
                     }
                 }
@@ -356,6 +366,7 @@ impl Connection {
                             Ok(packet) => {
                                 if packet.payload == Message::DropConnection {
                                     self.drop_connection().await;
+                                    debug_print!("Dropping connection because peer dropped connectio");
                                 }
                                 self.process_packet(packet).await;
                                 self.send(Message::KeepAlive).await;
@@ -367,15 +378,16 @@ impl Connection {
 
                 outgoing_message = self.from_app.recv() => {
                     if let Some(message) = outgoing_message {
-                        let is_drop = message == Message::DropConnection;
-                        self.send(message).await;
-
-                        if is_drop {
+                        if message != Message::DropConnection {
+                            self.send(message).await;
+                        } else {
                             self.drop_connection().await;
+                            debug_print!("Dropping connection because app sent drop connection message");
                             return;
                         }
                     } else {
                         self.drop_connection().await;
+                        debug_print!("Dropping connection because app's channel was destroyed");
                         return;
                     }
                 }
