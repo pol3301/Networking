@@ -186,12 +186,10 @@ impl Connection {
         let (tx_app, rx_us) = channel(32);
         let (tx_us, rx_app) = channel(32);
 
-        let tx_us_for_exit = tx_app.clone();
         tokio::spawn(async move {
             if let Ok(peer_addr) = punch_hole(&socket, peer).await {
                 let connection = Self::new(socket, peer_addr, rx_us, tx_us);
                 connection.main_loop().await;
-                let _ = tx_us_for_exit.send(Message::DropConnection).await;
             } else {
                 eprintln!("Couldn't establish connection to {}", peer);
             }
@@ -213,6 +211,11 @@ impl Connection {
                 bits = (bits - 1) & bits;
             }
         }
+    }
+
+    pub async fn drop_connection(&mut self) {
+        let _ = self.to_app.send(Message::DropConnection).await;
+        self.send(Message::DropConnection).await;
     }
 
     pub async fn process_packet(&mut self, packet: Packet) {
@@ -320,7 +323,7 @@ impl Connection {
                     }
 
                     if Instant::now() - self.status.last_contact_them >= Duration::from_secs(20) {
-                        self.send(Message::DropConnection).await;
+                        self.drop_connection().await;
                         return;
                     }
 
@@ -342,7 +345,7 @@ impl Connection {
                     };
 
                     if should_drop {
-                        self.send(Message::DropConnection).await;
+                        self.drop_connection().await;
                         return;
                     }
                 }
@@ -352,10 +355,10 @@ impl Connection {
                         match bincode::deserialize::<Packet>(&buf[..len]) {
                             Ok(packet) => {
                                 if packet.payload == Message::DropConnection {
-                                    let _ = self.to_app.send(packet.payload).await;
-                                    return;
+                                    self.drop_connection().await;
                                 }
                                 self.process_packet(packet).await;
+                                self.send(Message::KeepAlive).await;
                         },
                             Err(e) => eprintln!("Failed to parse packet: {}", e),
                         }
@@ -368,10 +371,11 @@ impl Connection {
                         self.send(message).await;
 
                         if is_drop {
+                            self.drop_connection().await;
                             return;
                         }
                     } else {
-                        self.send(Message::DropConnection).await;
+                        self.drop_connection().await;
                         return;
                     }
                 }
